@@ -1,0 +1,3 @@
+[security]
+# Python : l=64;print(''.join(random.sample((string.ascii_letters+string.digits)*math.ceil(l/(26*2+10)),k=l)))
+password_salt="E0Y8hNFM56R8rrBlCKGqwuvg9DjxptAH1dnlkdhY479mXLWfkQ1cGaCoFbENfyDs"

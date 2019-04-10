@@ -9,17 +9,19 @@ extern crate dotenv;
 
 use actix_redis::RedisSessionBackend;
 
-use rand::{RngCore};
-use rand::os::{OsRng};
+use rand::{RngCore,rngs::{OsRng}};
 use base64::{encode, decode};
 use std::sync::{Arc,Mutex};
 
 // actix web
 use actix_web::*;
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
-use actix_web::middleware::identity::{CookieIdentityPolicy, IdentityService,RequestIdentity};
-use actix_web::middleware::session::{SessionStorage,RequestSession};
-use actix_web::{FromRequest,HttpRequest, HttpResponse, http::ContentEncoding,HttpMessage};
+use actix_web::middleware::{
+    session::{SessionStorage,RequestSession},
+    identity::{CookieIdentityPolicy, IdentityService,RequestIdentity}
+};
+use actix_web::{ HttpResponse };
+mod middleware;
 
 // json serde
 extern crate serde;
@@ -33,21 +35,6 @@ mod app_config;
 // crypto
 extern crate crypto;
 
-fn is_login(req: &HttpRequest<Arc<Mutex<AppState>>>) -> bool {
-    let auth_token = match req.session().get::<String>(AUTH_TOKEN_NAME){
-        Ok(token)=>token,
-        Err(_)=>{return false;}
-    };
-    let recv_token = req.identity();
-    // どちらかのCookie値が空の場合(1行目)、または乱数値が違う場合(2行目)は、ログインをしていない。
-    if (auth_token==None || recv_token==None) || 
-        auth_token.unwrap() != recv_token.unwrap(){
-        false
-    }else{
-        true
-    }
-}
-
 static AUTH_TOKEN_NAME:&str="X-auth-token";
 
 mod auth;
@@ -57,14 +44,8 @@ fn redirect_to(redirect_uri:&str)->Result<HttpResponse>{
     Ok(HttpResponse::Found().header("location", redirect_uri).finish())
 }
 
-fn unauthorized(s:&str)->Result<HttpResponse>{
-    Ok(
-        HttpResponse::Unauthorized()
-        .content_encoding(ContentEncoding::Br)
-        .body(s.to_owned())
-    )
-}
-
+// 唯一ログイン前でもアクセス可能なリクエスト
+// 詳細は、middleware/login_checker.rs に記載
 fn login_exec((req,authinfo):(HttpRequest<Arc<Mutex<AppState>>>,Json<AuthInfo>)) -> Result<HttpResponse> {
     // ログイン実行リクエスト
     let authinfo = authinfo.into_inner();
@@ -73,10 +54,9 @@ fn login_exec((req,authinfo):(HttpRequest<Arc<Mutex<AppState>>>,Json<AuthInfo>))
         println!("authentication success : {:?}",auth);
         let _ = req.session().set("authinfo",auth);
     }else{
-        return unauthorized("Invalid credentials");
+        return self::middleware::login_checker::unauthorized("Invalid credentials");
     }
     // ログイン成功
-    
     let mut r = OsRng::new().unwrap();
     let mut auth_token=vec![0u8; 256/8]; // 256bit
     r.fill_bytes(&mut auth_token);
@@ -88,27 +68,19 @@ fn login_exec((req,authinfo):(HttpRequest<Arc<Mutex<AppState>>>,Json<AuthInfo>))
 }
 
 fn index(req: &HttpRequest<Arc<Mutex<AppState>>>) -> Result<HttpResponse> {
-    let not_login = Ok(HttpResponse::Ok()
-        .content_encoding(ContentEncoding::Gzip)
-        .body("Welcome Anonymous!\n".to_owned()));
-    if is_login(req) {
-        let counter = req.session().get::<i64>("counter")?.unwrap();
-        let authinfo = req.session().get::<auth::auth::AuthResult>("authinfo")?.unwrap();
-        req.session().set("counter",counter+1);
-        let mut groups=String::new();
-        for group in authinfo.groups(){
-            let mut group = group.name.clone();
-            group.push_str(" / ");
-            groups.push_str(&group);
-        }
-        for _ in 0..=2{let _ = groups.remove(groups.len()-1);}
-        
-        Ok(HttpResponse::Ok()
-            .content_encoding(ContentEncoding::Gzip)
-            .body(format!("welcome {} ({} group)\ncounter {:?}",authinfo.uname(),groups, counter)))
-    }else{
-        not_login
+    let counter = req.session().get::<i64>("counter")?.unwrap();
+    let authinfo = req.session().get::<auth::auth::AuthResult>("authinfo")?.unwrap();
+    let _ = req.session().set("counter",counter+1);
+    let mut groups=String::new();
+    for group in authinfo.groups(){
+        let mut group = group.name.clone();
+        group.push_str(" / ");
+        groups.push_str(&group);
     }
+    for _ in 0..=2{let _ = groups.remove(groups.len()-1);}
+    
+    Ok(HttpResponse::Ok()
+        .body(format!("welcome {} ({} group)\ncounter {:?}",authinfo.uname(),groups, counter)))
 }
 
 fn logout(req: HttpRequest<Arc<Mutex<AppState>>>) -> HttpResponse {
@@ -148,23 +120,27 @@ fn main() {
     builder.set_certificate_chain_file("cert.pem").unwrap();
     let state = Arc::new(Mutex::new(
             AppState::new(establish_connection().unwrap(),
-            conf
+            conf.clone()
         )));
     
+    let cookie_salt = base64::decode(&conf.security.get_cookie_salt()).unwrap();
+    let authtoken_salt = base64::decode(&conf.security.get_authtoken_salt()).unwrap();
     server::new(move|| {
         App::with_state(state.clone())
             .middleware(SessionStorage::new(
-                RedisSessionBackend::new("127.0.0.1:6379", &[0; 32])
+                RedisSessionBackend::new("127.0.0.1:6379", &cookie_salt)
                 .ttl(60*5) // expire 1 hour
                 .cookie_secure(true) // secure attribute
             ))
             .middleware(IdentityService::new(
-                CookieIdentityPolicy::new(&[0; 32])
+                CookieIdentityPolicy::new(&authtoken_salt)
                 .name(AUTH_TOKEN_NAME)
                 .secure(true)
             ))
+            .middleware(self::middleware::sec_header::SecurityHeaders)
+            .middleware(self::middleware::login_checker::LoginChecker)
             .resource("/", |r| r.method(http::Method::GET).f(|req| index(req)))
-            .resource("/login_exec",|r|r.method(http::Method::POST).with(login_exec))
+            .resource(&self::middleware::login_checker::login_uri(),|r|r.method(http::Method::POST).with(login_exec))
             .route("/logout",http::Method::GET,logout)
     }).bind_ssl("127.0.0.1:8443", builder).unwrap().workers(128).start();
 //    }).bind("127.0.0.1:8443").unwrap().start();
